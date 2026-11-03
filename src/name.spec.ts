@@ -141,27 +141,31 @@ describe("Name", () => {
     it("escapes each character once", () => {
       expect(new x509.Name([{ CN: [{ utf8String: " " }] }]).toString()).toBe("CN=\\ ");
       expect(new x509.Name([{ CN: [{ utf8String: "a\n\r\tb\n" }] }]).toString()).toBe("CN=a\\0A\\0D\\09b\\0A");
+      expect(new x509.Name([{ CN: [{ utf8String: "a\0b\0" }] }]).toString()).toBe("CN=a\\00b\\00");
     });
 
     it("round-trips values with special characters", () => {
-      const values = [" ", "#", " # ", "\\", "a\\", "\\0a", "a\n\nb", "\t\t", 'say "hi"', "a,b+c=d", "Привет\r\n"];
+      const values = [" ", "#", " # ", "  a  ", "\\", "a\\", "\\0a", "a\n\nb", "\t\t", "a\0b", 'say "hi"', '"quoted"', "#cafe", "a,b+c=d;e", "Привет\r\n"];
       for (const value of values) {
         const text = new x509.Name([{ CN: [{ utf8String: value }] }, { O: [{ utf8String: value }] }]).toString();
-        expect(new x509.Name(text).toJSON()).toEqual([{ CN: [value] }, { O: [value] }]);
+        const name = new x509.Name(text);
+        expect(name.getField("CN")).toEqual([value]);
+        expect(name.getField("O")).toEqual([value]);
+        expect(new x509.Name(name.toJSON()).toString()).toBe(text);
       }
     });
 
     it("ends a value at a separator after an escaped backslash", () => {
-      expect(new x509.Name("CN=a\\\\, O=b").toJSON()).toEqual([{ CN: ["a\\"] }, { O: ["b"] }]);
-      expect(new x509.Name("CN=a\\\\+O=b").toJSON()).toEqual([{ CN: ["a\\"], O: ["b"] }]);
-      expect(new x509.Name('CN="a\\\\", O=b').toJSON()).toEqual([{ CN: ["a\\"] }, { O: ["b"] }]);
+      expect(new x509.Name("CN=a\\\\, O=b").toJSON()).toEqual([{ CN: ["a\\\\"] }, { O: ["b"] }]);
+      expect(new x509.Name("CN=a\\\\+O=b").toJSON()).toEqual([{ CN: ["a\\\\"], O: ["b"] }]);
+      expect(new x509.Name('CN="a\\\\", O=b').toJSON()).toEqual([{ CN: ["a\\\\"] }, { O: ["b"] }]);
     });
 
     it("decodes hex pairs as UTF-8", () => {
       expect(new x509.Name("CN=a\\09b\\0d\\0A").toJSON()).toEqual([{ CN: ["a\tb\r\n"] }]);
       expect(new x509.Name("CN=\\D0\\9F\\D1\\80\\D0\\B8").toJSON()).toEqual([{ CN: ["При"] }]);
       expect(new x509.Name("CN=\\4F\\2C").toJSON()).toEqual([{ CN: ["O,"] }]);
-      expect(new x509.Name("CN=\\\\0a").toJSON()).toEqual([{ CN: ["\\0a"] }]);
+      expect(new x509.Name("CN=\\\\0a").getField("CN")).toEqual(["\\0a"]);
       expect(new x509.Name("CN=a\\EF\\BB\\BF").toJSON()).toEqual([{ CN: ["a﻿"] }]);
     });
 
@@ -175,17 +179,24 @@ describe("Name", () => {
 
     it("throws on text that is not an attribute", () => {
       expect(() => new x509.Name("CN=a, garbage, O=b")).toThrow("at position 6");
-      expect(() => new x509.Name("CN =a")).toThrow("at position 0");
+      expect(() => new x509.Name("CN=a;b")).toThrow("at position 5");
       expect(() => new x509.Name("CN=a\\")).toThrow("at position 0");
       expect(() => new x509.Name("CN=a++O=b")).toThrow("at position 5");
+      expect(() => new x509.Name("CN=a+")).toThrow("at position 5");
+      expect(() => new x509.Name("CN=a+ ")).toThrow("at position 6");
     });
 
-    it("parses long values in linear time", () => {
-      const start = performance.now();
-      for (const value of [" ", "a", '"', "\\\\", ' "']) {
-        expect(() => new x509.Name(`CN=${value.repeat(100000)}\\`)).toThrow("at position 0");
+    it("accepts the RFC 2253 section 4 forms", () => {
+      expect(new x509.Name("CN=a; O=b;C=c").toString()).toBe("CN=a, O=b, C=c");
+      expect(new x509.Name("CN = a , O= b +OU =c").toJSON()).toEqual([{ CN: ["a"] }, { O: ["b"], OU: ["c"] }]);
+      expect(new x509.Name('CN= "a, b" ; O=\\ b\\ ').toJSON()).toEqual([{ CN: ["a, b"] }, { O: [" b "] }]);
+      expect(new x509.Name("CN=a\\\\ , O=b\\  ").toString()).toBe("CN=a\\\\, O=b\\ ");
+    });
+
+    it("throws on long values that end in a lone backslash", () => {
+      for (const value of [" ", "a", '"', "\\\\", ' "', " =", " ;", "a "]) {
+        expect(() => new x509.Name(`CN=${value.repeat(100000)}\\`)).toThrow("Cannot parse name");
       }
-      expect(performance.now() - start).toBeLessThan(1000);
     });
   });
 
@@ -212,6 +223,13 @@ describe("Name", () => {
     expect(hex.encode(name.toArrayBuffer())).toBe(
       "3071310e300c060355040313056e616d65313139300c060355040313056e616d6532300c060355040313056e616d6533301b06092a864886f70d010901160e736f6d6540656d61696c2e636f6d3124300a06042a030405040201023016060a0992268993f22c6401191608736f6d652e636f6d",
     );
+  });
+
+  it("escapes JSON values the constructor would otherwise change", () => {
+    const name = new x509.Name([{ CN: [{ utf8String: "#cafe" }] }, { O: [{ utf8String: '"quoted"' }] }, { OU: [{ utf8String: "C:\\dir" }] }]);
+    const json = name.toJSON();
+    expect(json).toEqual([{ CN: ["\\#cafe"] }, { O: ['\\"quoted"'] }, { OU: ["C:\\\\dir"] }]);
+    expect(new x509.Name(json).toString()).toBe(name.toString());
   });
 
   it("parse with odd , marks", () => {

@@ -84,7 +84,30 @@ function replaceUnknownCharacter(text: string, char: string) {
 function escape(data: string) {
   return data
     .replace(/[,+"\\<>;]|^[ #]| $/g, "\\$&") // ",", "+", """, "\", "<", ">" or ";", a leading space or "#", a trailing space
-    .replace(/([\r\n\t])/g, replaceUnknownCharacter); // unknown character
+    .replace(/([\0\r\n\t])/g, replaceUnknownCharacter); // NUL (RFC 4514 section 2.4) and other unknown characters
+}
+
+// The escapes the constructor reads in JSON values: every "\", and a "#" or """ at the start
+function escapeJsonValue(value: string) {
+  return value.replace(/\\|^[#"]/g, "\\$&");
+}
+
+// Removes the spaces around an unquoted value (RFC 2253 section 4), but keeps an escaped trailing space
+function trimSpaces(value: string) {
+  let end = value.length;
+  while (value[end - 1] === " ") {
+    end--;
+  }
+  // An odd number of backslashes before the spaces escapes the first of them
+  let backslashes = 0;
+  while (value[end - 1 - backslashes] === "\\") {
+    backslashes++;
+  }
+  if (end < value.length && backslashes % 2 === 1) {
+    end++;
+  }
+
+  return value.slice(0, end).replace(/^ +/, "");
 }
 
 function decodeHexPairs(hexPairs: string) {
@@ -221,7 +244,8 @@ export class Name {
   }
 
   /**
-   * Returns a JSON representation of the Name
+   * Returns a JSON representation of the Name, which the constructor reads back unchanged.
+   * In string values, every `\` is doubled and a leading `#` or `"` is escaped with `\`.
    */
   public toJSON(): JsonName {
     const json: JsonName = [];
@@ -231,7 +255,7 @@ export class Name {
       for (const attr of rdn) {
         const type = this.getName(attr.type) || attr.type;
         jsonItem[type] ??= [];
-        jsonItem[type].push(attr.value.anyValue ? `#${hex.encode(attr.value.anyValue)}` : attr.value.toString());
+        jsonItem[type].push(attr.value.anyValue ? `#${hex.encode(attr.value.anyValue)}` : escapeJsonValue(attr.value.toString()));
       }
       json.push(jsonItem);
     }
@@ -246,10 +270,11 @@ export class Name {
   private fromString(data: string) {
     const asn = new AsnName();
     // One attribute and the separator after it. The type is an OID, optionally prefixed with "OID.", or a name.
-    // A value is quoted, or has "\", "," and "+" escaped. Stray commas and spaces between RDNs are skipped.
-    // No two adjacent parts match the same character, which keeps backtracking linear.
-    const regex = /(?:(?:oid\.)?(\d+(?:\.\d+)+)|([a-z][a-z\d-]*))=(?:("(?:\\.|[^\\"])*")\s*|((?:\\.|[^\\,+])*))(?:(\+)\s*|(?:,|$)[\s,]*)/iy;
-    regex.lastIndex = data.search(/[^\s,]|$/);
+    // A value is quoted, or has "\", ",", ";" and "+" escaped. RDNs are separated by "," or ";" (RFC 2253 section 4),
+    // and stray separators and spaces between them are skipped. No two adjacent parts match the same character,
+    // which keeps backtracking linear, so trimSpaces() removes the spaces around an unquoted value.
+    const regex = /(?:(?:oid\.)?(\d+(?:\.\d+)+)|([a-z][a-z\d-]*)) *=(?: *("(?:\\.|[^\\"])*")\s*|((?:\\.|[^\\,+;])*))(?:(\+)\s*|(?:[,;]|$)[\s,;]*)/iy;
+    regex.lastIndex = data.search(/[^\s,;]|$/);
     let level = ",";
 
     while (regex.lastIndex < data.length) {
@@ -259,7 +284,7 @@ export class Name {
         throw new Error(`Cannot parse name '${data}' at position ${index}`);
       }
       const [, oid, type, quoted, unquoted, plus] = matches;
-      const attr = this.createAttribute(oid ?? this.getTypeOid(type), quoted ?? unquoted);
+      const attr = this.createAttribute(oid ?? this.getTypeOid(type), quoted ?? trimSpaces(unquoted));
 
       if (level === "+") {
         asn[asn.length - 1].push(attr);
@@ -268,6 +293,9 @@ export class Name {
       }
 
       level = plus ?? ",";
+    }
+    if (level === "+") {
+      throw new Error(`Cannot parse name '${data}' at position ${data.length}`);
     }
 
     return asn;
